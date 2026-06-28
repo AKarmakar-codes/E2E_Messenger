@@ -248,17 +248,21 @@ fn start_polling(state_arc: Arc<Mutex<ClientState>>, server_url: String) {
                     Some(init) => {
                         // Bob initializes new session
                         let bob_dh_sec = if let Some(opk_pub) = init.used_one_time_prekey {
-                            // Find the private key corresponding to opk_pub
-                            let mut found_sec = None;
-                            for sec_bytes in &state.opk_secrets {
+                            // Find the private key corresponding to opk_pub and consume it
+                            let mut found_idx = None;
+                            for (idx, sec_bytes) in state.opk_secrets.iter().enumerate() {
                                 let sec = StaticSecret::from(*sec_bytes);
                                 if PublicKey::from(&sec).to_bytes() == opk_pub.to_bytes() {
-                                    found_sec = Some(sec);
+                                    found_idx = Some(idx);
                                     break;
                                 }
                             }
-                            match found_sec {
-                                Some(sec) => sec,
+                            match found_idx {
+                                Some(idx) => {
+                                    // Remove the spent OPK — one-time prekeys must not be reused
+                                    let sec_bytes = state.opk_secrets.remove(idx);
+                                    StaticSecret::from(sec_bytes)
+                                }
                                 None => {
                                     println!("\nError: Received message from {} using unknown OPK", msg.sender);
                                     print!("> ");
