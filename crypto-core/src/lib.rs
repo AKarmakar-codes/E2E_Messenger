@@ -5,6 +5,8 @@ use hkdf::Hkdf;
 use sha2::Sha256;
 use rand::rngs::OsRng;
 use rand::RngCore;
+use serde::{Serialize, Deserialize};
+use std::collections::HashMap;
 
 /// Performs Diffie-Hellman using X25519.
 pub fn dh(private: &StaticSecret, public: &PublicKey) -> [u8; 32] {
@@ -61,6 +63,415 @@ pub fn random_bytes_12() -> [u8; 12] {
     let mut bytes = [0u8; 12];
     OsRng.fill_bytes(&mut bytes);
     bytes
+}
+
+/// Represents Bob's public prekey bundle.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KeyBundle {
+    pub identity_key: PublicKey,            // IK_B (X25519)
+    pub identity_signing_key: VerifyingKey, // IK_sign_B (Ed25519)
+    pub signed_prekey: PublicKey,           // SPK_B (X25519)
+    pub signed_prekey_sig: Signature,       // Signature of SPK_B using IK_sign_B
+    pub one_time_prekey: Option<PublicKey>, // OPK_B (X25519)
+}
+
+/// Represents the initiation parameters sent by Alice to Bob.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct X3DHInit {
+    pub alice_identity_key: PublicKey,      // IK_A (X25519)
+    pub alice_ephemeral_key: PublicKey,     // EK_A (X25519)
+    pub used_one_time_prekey: Option<PublicKey>, // Which OPK_B Alice used, if any
+}
+
+/// Alice derives the X3DH shared secret (SK) using Bob's KeyBundle.
+/// Performs DH1, DH2, DH3, and optionally DH4, and verifies the signed prekey's signature.
+pub fn x3dh_alice_derive(
+    ik_a: &StaticSecret,
+    ek_a: &StaticSecret,
+    bob_bundle: &KeyBundle,
+) -> Result<[u8; 32], String> {
+    // 1. Verify Bob's SPK signature using his identity signing key
+    let spk_bytes = bob_bundle.signed_prekey.to_bytes();
+    if !verify(&bob_bundle.identity_signing_key, &spk_bytes, &bob_bundle.signed_prekey_sig) {
+        return Err("SPK signature verification failed".to_string());
+    }
+
+    // 2. Compute DH values
+    let dh1 = dh(ik_a, &bob_bundle.signed_prekey);
+    let dh2 = dh(ek_a, &bob_bundle.identity_key);
+    let dh3 = dh(ek_a, &bob_bundle.signed_prekey);
+
+    let mut ikm = Vec::with_capacity(128);
+    ikm.extend_from_slice(&dh1);
+    ikm.extend_from_slice(&dh2);
+    ikm.extend_from_slice(&dh3);
+
+    if let Some(opk) = &bob_bundle.one_time_prekey {
+        let dh4 = dh(ek_a, opk);
+        ikm.extend_from_slice(&dh4);
+    }
+
+    // 3. HKDF derivation
+    let salt = [0u8; 32];
+    let info = b"X3DH";
+    let sk_bytes = hkdf_derive(Some(&salt), &ikm, info, 32);
+    let mut sk = [0u8; 32];
+    sk.copy_from_slice(&sk_bytes);
+    Ok(sk)
+}
+
+/// Bob derives the X3DH shared secret (SK) using Alice's initiation parameters (X3DHInit).
+pub fn x3dh_bob_derive(
+    ik_b: &StaticSecret,
+    spk_b: &StaticSecret,
+    opk_b: Option<&StaticSecret>,
+    alice_init: &X3DHInit,
+) -> Result<[u8; 32], String> {
+    // 1. Compute DH values
+    let dh1 = dh(spk_b, &alice_init.alice_identity_key);
+    let dh2 = dh(ik_b, &alice_init.alice_ephemeral_key);
+    let dh3 = dh(spk_b, &alice_init.alice_ephemeral_key);
+
+    let mut ikm = Vec::with_capacity(128);
+    ikm.extend_from_slice(&dh1);
+    ikm.extend_from_slice(&dh2);
+    ikm.extend_from_slice(&dh3);
+
+    if let Some(opk_secret) = opk_b {
+        let dh4 = dh(opk_secret, &alice_init.alice_ephemeral_key);
+        ikm.extend_from_slice(&dh4);
+    } else if alice_init.used_one_time_prekey.is_some() {
+        return Err("Alice expected one-time prekey, but Bob didn't provide one".to_string());
+    }
+
+    // 2. HKDF derivation
+    let salt = [0u8; 32];
+    let info = b"X3DH";
+    let sk_bytes = hkdf_derive(Some(&salt), &ikm, info, 32);
+    let mut sk = [0u8; 32];
+    sk.copy_from_slice(&sk_bytes);
+    Ok(sk)
+}
+
+/// Derives the next chain key and a message key using HKDF-SHA256.
+pub fn kdf_ck(ck: [u8; 32]) -> ([u8; 32], [u8; 32]) {
+    let ck_bytes = hkdf_derive(Some(&ck), &[1], b"ChainKeyStep", 32);
+    let mk_bytes = hkdf_derive(Some(&ck), &[2], b"MessageKeyDerivation", 32);
+    let mut ck_new = [0u8; 32];
+    let mut mk = [0u8; 32];
+    ck_new.copy_from_slice(&ck_bytes);
+    mk.copy_from_slice(&mk_bytes);
+    (ck_new, mk)
+}
+
+/// Represents the header of a Double Ratchet message.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessageHeader {
+    pub dh_pub: PublicKey,
+    pub n: u32,
+    pub pn: u32,
+}
+
+/// Represents a Double Ratchet encrypted message.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EncryptedMessage {
+    pub header: MessageHeader,
+    pub ciphertext: Vec<u8>,
+}
+
+/// The state of a Double Ratchet session.
+pub struct DoubleRatchet {
+    pub dhs: StaticSecret,
+    pub dhs_pub: PublicKey,
+    pub dhr: Option<PublicKey>,
+    pub rk: [u8; 32],
+    pub ck_s: Option<[u8; 32]>,
+    pub ck_r: Option<[u8; 32]>,
+    pub ns: u32,
+    pub nr: u32,
+    pub pn: u32,
+    pub mk_skipped: HashMap<([u8; 32], u32), [u8; 32]>,
+}
+
+impl Serialize for DoubleRatchet {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let dhs_bytes = self.dhs.to_bytes();
+        let dhr_bytes = self.dhr.map(|k| k.to_bytes());
+        let mk_skipped_vec: Vec<(([u8; 32], u32), [u8; 32])> = self.mk_skipped.iter().map(|(k, v)| (*k, *v)).collect();
+
+        let state = SerializableDoubleRatchet {
+            dhs_bytes,
+            dhs_pub: self.dhs_pub.to_bytes(),
+            dhr_bytes,
+            rk: self.rk,
+            ck_s: self.ck_s,
+            ck_r: self.ck_r,
+            ns: self.ns,
+            nr: self.nr,
+            pn: self.pn,
+            mk_skipped: mk_skipped_vec,
+        };
+        state.serialize(serializer)
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct SerializableDoubleRatchet {
+    dhs_bytes: [u8; 32],
+    dhs_pub: [u8; 32],
+    dhr_bytes: Option<[u8; 32]>,
+    rk: [u8; 32],
+    ck_s: Option<[u8; 32]>,
+    ck_r: Option<[u8; 32]>,
+    ns: u32,
+    nr: u32,
+    pn: u32,
+    mk_skipped: Vec<(([u8; 32], u32), [u8; 32])>,
+}
+
+impl<'de> Deserialize<'de> for DoubleRatchet {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let state = SerializableDoubleRatchet::deserialize(deserializer)?;
+        let dhs = StaticSecret::from(state.dhs_bytes);
+        let dhs_pub = PublicKey::from(state.dhs_pub);
+        let dhr = state.dhr_bytes.map(PublicKey::from);
+        let mk_skipped = state.mk_skipped.into_iter().collect();
+
+        Ok(Self {
+            dhs,
+            dhs_pub,
+            dhr,
+            rk: state.rk,
+            ck_s: state.ck_s,
+            ck_r: state.ck_r,
+            ns: state.ns,
+            nr: state.nr,
+            pn: state.pn,
+            mk_skipped,
+        })
+    }
+}
+
+impl DoubleRatchet {
+    const MAX_SKIP: u32 = 1000;
+
+    /// Initialize Alice's Double Ratchet state (initiator).
+    pub fn init_alice(sk: [u8; 32], bob_dh_pub: PublicKey) -> Self {
+        let entropy = random_bytes_32();
+        let dhs = StaticSecret::from(entropy);
+        let dhs_pub = PublicKey::from(&dhs);
+
+        // DH = dhs * bob_dh_pub
+        let shared_dh = dh(&dhs, &bob_dh_pub);
+
+        // KDF_RK(rk=sk, DH)
+        let salt = sk;
+        let info = b"WhisperRatchetRoot";
+        let derived = hkdf_derive(Some(&salt), &shared_dh, info, 64);
+        let mut rk = [0u8; 32];
+        let mut ck_s = [0u8; 32];
+        rk.copy_from_slice(&derived[0..32]);
+        ck_s.copy_from_slice(&derived[32..64]);
+
+        Self {
+            dhs,
+            dhs_pub,
+            dhr: Some(bob_dh_pub),
+            rk,
+            ck_s: Some(ck_s),
+            ck_r: None,
+            ns: 0,
+            nr: 0,
+            pn: 0,
+            mk_skipped: HashMap::new(),
+        }
+    }
+
+    /// Initialize Bob's Double Ratchet state (responder).
+    pub fn init_bob(sk: [u8; 32], bob_dh_sec: StaticSecret) -> Self {
+        let bob_dh_pub = PublicKey::from(&bob_dh_sec);
+        Self {
+            dhs: bob_dh_sec,
+            dhs_pub: bob_dh_pub,
+            dhr: None,
+            rk: sk,
+            ck_s: None,
+            ck_r: None,
+            ns: 0,
+            nr: 0,
+            pn: 0,
+            mk_skipped: HashMap::new(),
+        }
+    }
+
+    /// Encrypts a message payload. Prepend 12-byte random nonce to ciphertext.
+    pub fn ratchet_encrypt(&mut self, plaintext: &[u8], ad: &[u8]) -> Result<EncryptedMessage, String> {
+        let ck_s = self.ck_s.ok_or_else(|| "Sending chain key not initialized".to_string())?;
+        
+        let (ck_s_next, mk) = kdf_ck(ck_s);
+        self.ck_s = Some(ck_s_next);
+
+        let header = MessageHeader {
+            dh_pub: self.dhs_pub,
+            n: self.ns,
+            pn: self.pn,
+        };
+        self.ns += 1;
+
+        let header_bytes = serde_json::to_vec(&header).map_err(|e| e.to_string())?;
+        let mut full_ad = ad.to_vec();
+        full_ad.extend_from_slice(&header_bytes);
+
+        let nonce = random_bytes_12();
+        let ciphertext = aead_seal(&mk, &nonce, plaintext, &full_ad);
+
+        let mut payload = nonce.to_vec();
+        payload.extend_from_slice(&ciphertext);
+
+        Ok(EncryptedMessage {
+            header,
+            ciphertext: payload,
+        })
+    }
+
+    /// Decrypts an encrypted message.
+    pub fn ratchet_decrypt(&mut self, msg: &EncryptedMessage, ad: &[u8]) -> Result<Vec<u8>, String> {
+        let (plaintext, _) = self.ratchet_decrypt_verbose(msg, ad)?;
+        Ok(plaintext)
+    }
+
+    /// Decrypts an encrypted message and returns both the plaintext and the derived message key.
+    pub fn ratchet_decrypt_verbose(&mut self, msg: &EncryptedMessage, ad: &[u8]) -> Result<(Vec<u8>, [u8; 32]), String> {
+        let header_bytes = serde_json::to_vec(&msg.header).map_err(|e| e.to_string())?;
+        let mut full_ad = ad.to_vec();
+        full_ad.extend_from_slice(&header_bytes);
+
+        let dh_pub_bytes = msg.header.dh_pub.to_bytes();
+
+        // 1. Check if we already have the skipped message key
+        if let Some(mk) = self.mk_skipped.remove(&(dh_pub_bytes, msg.header.n)) {
+            let plaintext = self.decrypt_with_key(&msg.ciphertext, &mk, &full_ad)?;
+            return Ok((plaintext, mk));
+        }
+
+        // 2. DH ratchet step if partner's DH key changed
+        if Some(msg.header.dh_pub) != self.dhr {
+            self.skip_message_keys(msg.header.pn)?;
+            self.dh_ratchet(msg.header.dh_pub)?;
+        }
+
+        // 3. Skip message keys on current receiving chain up to msg.header.n
+        self.skip_message_keys(msg.header.n)?;
+
+        // 4. Derive message key for current message
+        let ck_r = self.ck_r.ok_or_else(|| "Receiving chain key not initialized".to_string())?;
+        let (ck_r_next, mk) = kdf_ck(ck_r);
+        self.ck_r = Some(ck_r_next);
+        self.nr += 1;
+
+        // 5. Decrypt using newly derived key
+        let plaintext = self.decrypt_with_key(&msg.ciphertext, &mk, &full_ad)?;
+        Ok((plaintext, mk))
+    }
+
+    /// A helper method to attempt to decrypt an encrypted message with a specific message key.
+    /// This is used to demonstrate forward secrecy.
+    pub fn decrypt_message_with_key(&self, msg: &EncryptedMessage, mk: &[u8; 32], ad: &[u8]) -> Result<Vec<u8>, String> {
+        let header_bytes = serde_json::to_vec(&msg.header).map_err(|e| e.to_string())?;
+        let mut full_ad = ad.to_vec();
+        full_ad.extend_from_slice(&header_bytes);
+        self.decrypt_with_key(&msg.ciphertext, mk, &full_ad)
+    }
+
+    fn decrypt_with_key(&self, ciphertext: &[u8], mk: &[u8; 32], full_ad: &[u8]) -> Result<Vec<u8>, String> {
+        if ciphertext.len() < 12 {
+            return Err("Ciphertext too short".to_string());
+        }
+        let mut nonce = [0u8; 12];
+        nonce.copy_from_slice(&ciphertext[0..12]);
+        let ciphertext_actual = &ciphertext[12..];
+
+        aead_open(mk, &nonce, ciphertext_actual, full_ad)
+            .map_err(|e| format!("AEAD decryption failed: {:?}", e))
+    }
+
+    fn skip_message_keys(&mut self, until_n: u32) -> Result<(), String> {
+        if let Some(ck_r) = self.ck_r {
+            if self.nr + Self::MAX_SKIP < until_n {
+                return Err("Too many skipped messages".to_string());
+            }
+            let mut current_ck = ck_r;
+            while self.nr < until_n {
+                let (next_ck, mk) = kdf_ck(current_ck);
+                let dhr_bytes = self.dhr.ok_or_else(|| "dhr is empty".to_string())?.to_bytes();
+                self.mk_skipped.insert((dhr_bytes, self.nr), mk);
+                current_ck = next_ck;
+                self.nr += 1;
+            }
+            self.ck_r = Some(current_ck);
+        }
+        Ok(())
+    }
+
+    fn dh_ratchet(&mut self, header_dh_pub: PublicKey) -> Result<(), String> {
+        self.pn = self.ns;
+        self.ns = 0;
+        self.nr = 0;
+        self.dhr = Some(header_dh_pub);
+
+        // DH(dhs, dhr)
+        let shared_dh_recv = dh(&self.dhs, &header_dh_pub);
+        // KDF_RK(rk, DH)
+        let salt = self.rk;
+        let info = b"WhisperRatchetRoot";
+        let derived_recv = hkdf_derive(Some(&salt), &shared_dh_recv, info, 64);
+        self.rk.copy_from_slice(&derived_recv[0..32]);
+        let mut ck_r = [0u8; 32];
+        ck_r.copy_from_slice(&derived_recv[32..64]);
+        self.ck_r = Some(ck_r);
+
+        // Generate new local DH key pair
+        let entropy = random_bytes_32();
+        let dhs_new = StaticSecret::from(entropy);
+        let dhs_pub_new = PublicKey::from(&dhs_new);
+        self.dhs = dhs_new;
+        self.dhs_pub = dhs_pub_new;
+
+        // DH(dhs, dhr)
+        let shared_dh_send = dh(&self.dhs, &header_dh_pub);
+        let salt_send = self.rk;
+        let derived_send = hkdf_derive(Some(&salt_send), &shared_dh_send, info, 64);
+        self.rk.copy_from_slice(&derived_send[0..32]);
+        let mut ck_s = [0u8; 32];
+        ck_s.copy_from_slice(&derived_send[32..64]);
+        self.ck_s = Some(ck_s);
+
+        Ok(())
+    }
+}
+
+/// Represents Bob's public prekey bundle announcement.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrekeyBundleAnnouncement {
+    pub identity_key: PublicKey,            // IK_B (X25519)
+    pub identity_signing_key: VerifyingKey, // IK_sign_B (Ed25519)
+    pub signed_prekey: PublicKey,           // SPK_B (X25519)
+    pub signed_prekey_sig: Signature,       // Signature of SPK_B using IK_sign_B
+    pub one_time_prekeys: Vec<PublicKey>,   // Pool of OPK_B (X25519)
+}
+
+/// Represents a message stored in a user's inbox on the server.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InboxMessage {
+    pub sender: String,
+    pub x3dh_init: Option<X3DHInit>,
+    pub ratchet_message: EncryptedMessage,
 }
 
 #[cfg(test)]
@@ -179,6 +590,320 @@ mod tests {
         let mut tampered_message = message.to_vec();
         tampered_message[0] ^= 1;
         assert!(!verify(&verifying_key, &tampered_message, &signature));
+    }
+
+    #[test]
+    fn test_x3dh_with_opk() {
+        // Bob's keys
+        let mut bob_ik_entropy = [0u8; 32];
+        OsRng.fill_bytes(&mut bob_ik_entropy);
+        let bob_ik_sec = StaticSecret::from(bob_ik_entropy);
+        let bob_ik_pub = PublicKey::from(&bob_ik_sec);
+
+        let mut bob_spk_entropy = [0u8; 32];
+        OsRng.fill_bytes(&mut bob_spk_entropy);
+        let bob_spk_sec = StaticSecret::from(bob_spk_entropy);
+        let bob_spk_pub = PublicKey::from(&bob_spk_sec);
+
+        let mut bob_sign_entropy = [0u8; 32];
+        OsRng.fill_bytes(&mut bob_sign_entropy);
+        let bob_sign_key = SigningKey::from_bytes(&bob_sign_entropy);
+        let bob_verify_key = bob_sign_key.verifying_key();
+
+        // Sign Bob's SPK public bytes
+        let spk_bytes = bob_spk_pub.to_bytes();
+        let spk_sig = sign(&bob_sign_key, &spk_bytes);
+
+        let mut bob_opk_entropy = [0u8; 32];
+        OsRng.fill_bytes(&mut bob_opk_entropy);
+        let bob_opk_sec = StaticSecret::from(bob_opk_entropy);
+        let bob_opk_pub = PublicKey::from(&bob_opk_sec);
+
+        let bob_bundle = KeyBundle {
+            identity_key: bob_ik_pub,
+            identity_signing_key: bob_verify_key,
+            signed_prekey: bob_spk_pub,
+            signed_prekey_sig: spk_sig,
+            one_time_prekey: Some(bob_opk_pub),
+        };
+
+        // Alice's keys
+        let mut alice_ik_entropy = [0u8; 32];
+        OsRng.fill_bytes(&mut alice_ik_entropy);
+        let alice_ik_sec = StaticSecret::from(alice_ik_entropy);
+        let alice_ik_pub = PublicKey::from(&alice_ik_sec);
+
+        let mut alice_ek_entropy = [0u8; 32];
+        OsRng.fill_bytes(&mut alice_ek_entropy);
+        let alice_ek_sec = StaticSecret::from(alice_ek_entropy);
+        let alice_ek_pub = PublicKey::from(&alice_ek_sec);
+
+        // Alice derives SK
+        let alice_sk = x3dh_alice_derive(&alice_ik_sec, &alice_ek_sec, &bob_bundle).unwrap();
+
+        // Initiation params Alice sends to Bob
+        let alice_init = X3DHInit {
+            alice_identity_key: alice_ik_pub,
+            alice_ephemeral_key: alice_ek_pub,
+            used_one_time_prekey: Some(bob_opk_pub),
+        };
+
+        // Bob derives SK
+        let bob_sk = x3dh_bob_derive(&bob_ik_sec, &bob_spk_sec, Some(&bob_opk_sec), &alice_init).unwrap();
+
+        // Assert shared secrets match
+        assert_eq!(alice_sk, bob_sk);
+    }
+
+    #[test]
+    fn test_x3dh_without_opk() {
+        // Bob's keys
+        let mut bob_ik_entropy = [0u8; 32];
+        OsRng.fill_bytes(&mut bob_ik_entropy);
+        let bob_ik_sec = StaticSecret::from(bob_ik_entropy);
+        let bob_ik_pub = PublicKey::from(&bob_ik_sec);
+
+        let mut bob_spk_entropy = [0u8; 32];
+        OsRng.fill_bytes(&mut bob_spk_entropy);
+        let bob_spk_sec = StaticSecret::from(bob_spk_entropy);
+        let bob_spk_pub = PublicKey::from(&bob_spk_sec);
+
+        let mut bob_sign_entropy = [0u8; 32];
+        OsRng.fill_bytes(&mut bob_sign_entropy);
+        let bob_sign_key = SigningKey::from_bytes(&bob_sign_entropy);
+        let bob_verify_key = bob_sign_key.verifying_key();
+
+        // Sign Bob's SPK public bytes
+        let spk_bytes = bob_spk_pub.to_bytes();
+        let spk_sig = sign(&bob_sign_key, &spk_bytes);
+
+        let bob_bundle = KeyBundle {
+            identity_key: bob_ik_pub,
+            identity_signing_key: bob_verify_key,
+            signed_prekey: bob_spk_pub,
+            signed_prekey_sig: spk_sig,
+            one_time_prekey: None,
+        };
+
+        // Alice's keys
+        let mut alice_ik_entropy = [0u8; 32];
+        OsRng.fill_bytes(&mut alice_ik_entropy);
+        let alice_ik_sec = StaticSecret::from(alice_ik_entropy);
+        let alice_ik_pub = PublicKey::from(&alice_ik_sec);
+
+        let mut alice_ek_entropy = [0u8; 32];
+        OsRng.fill_bytes(&mut alice_ek_entropy);
+        let alice_ek_sec = StaticSecret::from(alice_ek_entropy);
+        let alice_ek_pub = PublicKey::from(&alice_ek_sec);
+
+        // Alice derives SK
+        let alice_sk = x3dh_alice_derive(&alice_ik_sec, &alice_ek_sec, &bob_bundle).unwrap();
+
+        // Initiation params Alice sends to Bob
+        let alice_init = X3DHInit {
+            alice_identity_key: alice_ik_pub,
+            alice_ephemeral_key: alice_ek_pub,
+            used_one_time_prekey: None,
+        };
+
+        // Bob derives SK
+        let bob_sk = x3dh_bob_derive(&bob_ik_sec, &bob_spk_sec, None, &alice_init).unwrap();
+
+        // Assert shared secrets match
+        assert_eq!(alice_sk, bob_sk);
+    }
+
+    #[test]
+    fn test_x3dh_signature_tamper() {
+        // Bob's keys
+        let mut bob_ik_entropy = [0u8; 32];
+        OsRng.fill_bytes(&mut bob_ik_entropy);
+        let bob_ik_pub = PublicKey::from(&StaticSecret::from(bob_ik_entropy));
+
+        let mut bob_spk_entropy = [0u8; 32];
+        OsRng.fill_bytes(&mut bob_spk_entropy);
+        let bob_spk_pub = PublicKey::from(&StaticSecret::from(bob_spk_entropy));
+
+        let mut bob_sign_entropy = [0u8; 32];
+        OsRng.fill_bytes(&mut bob_sign_entropy);
+        let bob_sign_key = SigningKey::from_bytes(&bob_sign_entropy);
+        let bob_verify_key = bob_sign_key.verifying_key();
+
+        // Sign Bob's SPK public bytes
+        let spk_bytes = bob_spk_pub.to_bytes();
+        let mut spk_sig = sign(&bob_sign_key, &spk_bytes);
+
+        // Tamper signature bytes
+        let mut sig_bytes = spk_sig.to_bytes();
+        sig_bytes[0] ^= 1;
+        spk_sig = Signature::from_bytes(&sig_bytes);
+
+        let bob_bundle = KeyBundle {
+            identity_key: bob_ik_pub,
+            identity_signing_key: bob_verify_key,
+            signed_prekey: bob_spk_pub,
+            signed_prekey_sig: spk_sig,
+            one_time_prekey: None,
+        };
+
+        // Alice's keys
+        let mut alice_ik_entropy = [0u8; 32];
+        OsRng.fill_bytes(&mut alice_ik_entropy);
+        let alice_ik_sec = StaticSecret::from(alice_ik_entropy);
+
+        let mut alice_ek_entropy = [0u8; 32];
+        OsRng.fill_bytes(&mut alice_ek_entropy);
+        let alice_ek_sec = StaticSecret::from(alice_ek_entropy);
+
+        // Alice derives SK - should fail
+        let alice_result = x3dh_alice_derive(&alice_ik_sec, &alice_ek_sec, &bob_bundle);
+        assert!(alice_result.is_err());
+        assert_eq!(alice_result.unwrap_err(), "SPK signature verification failed");
+    }
+
+    #[test]
+    fn test_ratchet_in_order() {
+        let sk = [42u8; 32];
+        let mut bob_dh_entropy = [0u8; 32];
+        OsRng.fill_bytes(&mut bob_dh_entropy);
+        let bob_dh_sec = StaticSecret::from(bob_dh_entropy);
+        let bob_dh_pub = PublicKey::from(&bob_dh_sec);
+
+        let mut alice = DoubleRatchet::init_alice(sk, bob_dh_pub);
+        let mut bob = DoubleRatchet::init_bob(sk, bob_dh_sec);
+
+        let ad = b"AssociatedData";
+
+        // Alice sends to Bob
+        let msg1 = alice.ratchet_encrypt(b"Hello Bob!", ad).unwrap();
+        let dec1 = bob.ratchet_decrypt(&msg1, ad).unwrap();
+        assert_eq!(dec1, b"Hello Bob!");
+
+        // Bob replies to Alice
+        let msg2 = bob.ratchet_encrypt(b"Hello Alice!", ad).unwrap();
+        let dec2 = alice.ratchet_decrypt(&msg2, ad).unwrap();
+        assert_eq!(dec2, b"Hello Alice!");
+
+        // Alice sends another one
+        let msg3 = alice.ratchet_encrypt(b"How are you?", ad).unwrap();
+        let dec3 = bob.ratchet_decrypt(&msg3, ad).unwrap();
+        assert_eq!(dec3, b"How are you?");
+    }
+
+    #[test]
+    fn test_ratchet_out_of_order() {
+        let sk = [99u8; 32];
+        let mut bob_dh_entropy = [0u8; 32];
+        OsRng.fill_bytes(&mut bob_dh_entropy);
+        let bob_dh_sec = StaticSecret::from(bob_dh_entropy);
+        let bob_dh_pub = PublicKey::from(&bob_dh_sec);
+
+        let mut alice = DoubleRatchet::init_alice(sk, bob_dh_pub);
+        let mut bob = DoubleRatchet::init_bob(sk, bob_dh_sec);
+
+        let ad = b"AssociatedData";
+
+        // Alice encrypts 3 messages
+        let msg1 = alice.ratchet_encrypt(b"Message 1", ad).unwrap();
+        let msg2 = alice.ratchet_encrypt(b"Message 2", ad).unwrap();
+        let msg3 = alice.ratchet_encrypt(b"Message 3", ad).unwrap();
+
+        // Bob decrypts msg3 first (msg1 and msg2 keys will be skipped and cached)
+        let dec3 = bob.ratchet_decrypt(&msg3, ad).unwrap();
+        assert_eq!(dec3, b"Message 3");
+
+        // Bob decrypts msg1 next (from skipped keys cache)
+        let dec1 = bob.ratchet_decrypt(&msg1, ad).unwrap();
+        assert_eq!(dec1, b"Message 1");
+
+        // Bob decrypts msg2 next (from skipped keys cache)
+        let dec2 = bob.ratchet_decrypt(&msg2, ad).unwrap();
+        assert_eq!(dec2, b"Message 2");
+    }
+
+    #[test]
+    fn test_ratchet_dropped_message() {
+        let sk = [7u8; 32];
+        let mut bob_dh_entropy = [0u8; 32];
+        OsRng.fill_bytes(&mut bob_dh_entropy);
+        let bob_dh_sec = StaticSecret::from(bob_dh_entropy);
+        let bob_dh_pub = PublicKey::from(&bob_dh_sec);
+
+        let mut alice = DoubleRatchet::init_alice(sk, bob_dh_pub);
+        let mut bob = DoubleRatchet::init_bob(sk, bob_dh_sec);
+
+        let ad = b"AssociatedData";
+
+        let _msg1 = alice.ratchet_encrypt(b"Message 1", ad).unwrap();
+        let msg2 = alice.ratchet_encrypt(b"Message 2", ad).unwrap(); // We will drop msg1
+
+        let dec2 = bob.ratchet_decrypt(&msg2, ad).unwrap();
+        assert_eq!(dec2, b"Message 2");
+    }
+
+    #[test]
+    fn test_ratchet_simultaneous_send() {
+        let sk = [111u8; 32];
+        let mut bob_dh_entropy = [0u8; 32];
+        OsRng.fill_bytes(&mut bob_dh_entropy);
+        let bob_dh_sec = StaticSecret::from(bob_dh_entropy);
+        let bob_dh_pub = PublicKey::from(&bob_dh_sec);
+
+        let mut alice = DoubleRatchet::init_alice(sk, bob_dh_pub);
+        let mut bob = DoubleRatchet::init_bob(sk, bob_dh_sec);
+
+        let ad = b"AssociatedData";
+
+        // Alice sends to Bob
+        let a_to_b_1 = alice.ratchet_encrypt(b"Alice message 1", ad).unwrap();
+
+        // Bob decrypts first Alice message so Bob's receiving chain is established
+        let dec_b1 = bob.ratchet_decrypt(&a_to_b_1, ad).unwrap();
+        assert_eq!(dec_b1, b"Alice message 1");
+
+        // Now both send concurrently before receiving a reply
+        let a_to_b_2 = alice.ratchet_encrypt(b"Alice message 2", ad).unwrap();
+        let b_to_a_2 = bob.ratchet_encrypt(b"Bob message 2", ad).unwrap();
+
+        // Alice decrypts Bob's message
+        let dec_a2 = alice.ratchet_decrypt(&b_to_a_2, ad).unwrap();
+        assert_eq!(dec_a2, b"Bob message 2");
+
+        // Bob decrypts Alice's concurrent message
+        let dec_b2 = bob.ratchet_decrypt(&a_to_b_2, ad).unwrap();
+        assert_eq!(dec_b2, b"Alice message 2");
+    }
+
+    #[test]
+    fn test_ratchet_serialization() {
+        let sk = [77u8; 32];
+        let mut bob_dh_entropy = [0u8; 32];
+        OsRng.fill_bytes(&mut bob_dh_entropy);
+        let bob_dh_sec = StaticSecret::from(bob_dh_entropy);
+        let bob_dh_pub = PublicKey::from(&bob_dh_sec);
+
+        let mut alice = DoubleRatchet::init_alice(sk, bob_dh_pub);
+        let mut bob = DoubleRatchet::init_bob(sk, bob_dh_sec);
+
+        let ad = b"AssociatedData";
+
+        // Alice sends message 1
+        let msg1 = alice.ratchet_encrypt(b"Hello", ad).unwrap();
+        let dec1 = bob.ratchet_decrypt(&msg1, ad).unwrap();
+        assert_eq!(dec1, b"Hello");
+
+        // Serialize Alice and Bob states
+        let alice_serialized = serde_json::to_vec(&alice).unwrap();
+        let bob_serialized = serde_json::to_vec(&bob).unwrap();
+
+        // Deserialize Alice and Bob states
+        let mut alice_restored: DoubleRatchet = serde_json::from_slice(&alice_serialized).unwrap();
+        let mut bob_restored: DoubleRatchet = serde_json::from_slice(&bob_serialized).unwrap();
+
+        // Alice sends message 2 using restored state
+        let msg2 = alice_restored.ratchet_encrypt(b"World", ad).unwrap();
+        let dec2 = bob_restored.ratchet_decrypt(&msg2, ad).unwrap();
+        assert_eq!(dec2, b"World");
     }
 
     fn verifying_key_from_signing(signing_key: &SigningKey) -> VerifyingKey {
