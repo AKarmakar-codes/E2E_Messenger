@@ -115,8 +115,8 @@ async fn main() {
 
     let app = Router::new()
         .route("/register", post(register))
-        .route("/bundles/{user}", post(publish_bundle).get(fetch_bundle))
-        .route("/inbox/{user}", post(enqueue_message).get(drain_inbox))
+        .route("/bundles/:user", post(publish_bundle).get(fetch_bundle))
+        .route("/inbox/:user", post(enqueue_message).get(drain_inbox))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:3000")
