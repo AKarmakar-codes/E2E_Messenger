@@ -1,31 +1,88 @@
-Poseidon hash
-A hash function takes any input and produces a fixed-size fingerprint — same input always gives the same output, and you can't work backward from the output to the input. You already know hashes like SHA-256. Poseidon does the same job, but it's designed specifically to be cheap inside a zero-knowledge circuit.
-Here's why that matters: SHA-256 is built from bitwise operations (XOR, bit rotations, AND) that are cheap for a normal CPU but brutally expensive to express as arithmetic constraints (the language ZK circuits are built in — additions and multiplications over a large prime field). Every XOR needs to be decomposed into many field operations. Poseidon is built entirely out of field-native operations from the start (additions, multiplications, and a nonlinear step), so representing it inside a circuit costs a fraction of what SHA-256 would. That's the entire reason it exists — it's a hash function optimized for "cheap to prove," not for hardware speed.
-In your protocol, Poseidon is what computes h = Poseidon(m, r) — and critically, this computation happens inside the proof circuit itself, not just alongside it. The proof needs to demonstrate "I know an m and r that hash to this h" as part of the same proof that shows "and this m passes the classifier."
-Associated Data (AD)
-This is a feature already built into the AEAD encryption Signal-style protocols use (the encryption at the heart of the Double Ratchet). AEAD encryption normally takes a key and a plaintext, and gives you ciphertext + an authentication tag. AD is an optional third input: extra data that isn't encrypted (it travels in the clear) but is cryptographically tied to that specific ciphertext via the authentication tag.
-Concretely: if you encrypt message m under key K with AD = h, then decryption only succeeds if the receiver decrypts with that exact same h as AD. Change even one bit of h, and decryption fails outright — the tag won't verify. So AD isn't secret, but it's bound: you can't swap it out after the fact without breaking the ciphertext's integrity.
-That's exactly why it's useful here — the Double Ratchet already computes an authentication tag over (ciphertext, AD). By setting AD = (h, r), you get "the fingerprint travels with the message, and tampering with the fingerprint breaks decryption" for free, without touching the ratchet's internals at all.
-Plonky2
-This is the actual proving system — the machinery that turns "I know secret values satisfying these constraints" into a small proof that anyone can verify quickly, without seeing the secrets. Two properties matter for your use case:
+Here is the text refactored into a cleanly structured, highly scannable Markdown document.
 
-Transparent setup: some proof systems (like Groth16) need a one-time "trusted setup" ceremony per circuit — if you ever change the circuit (e.g., update the classifier), you need a new ceremony, which is a real operational headache. Plonky2 needs no such ceremony, so updating the model doesn't require redoing any cryptographic setup.
-Fast proving, native Rust: it's currently one of the fastest provers for circuits of this size, and since your CLI is already Rust, there's no awkward bridge between languages.
+---
 
-Plonky2 is where you write the actual circuit: "given public values θ, b, τ, h — and private (secret) values m, r — check that Cθ(ϕ(m)) = 1 AND Poseidon(m, r) = h." Running this circuit through Plonky2's prover gives you the proof π. Running it through the verifier (a much cheaper operation) gives a yes/no on whether π is valid, without ever seeing m or r.
-How they all integrate — the full data flow
+# Cryptographic Architecture Overview
 
-Sender, locally: has plaintext m, picks random r.
-Computes f = ϕ(m) (the feature vector) — plain computation, not inside the circuit.
-Feeds (m, r, f) as private witnesses and (θ, b, τ) as public inputs into the Plonky2 circuit, which internally:
+This document outlines the core cryptographic components and the integrated data flow used to achieve private, verifiable message filtering.
 
-Computes Cθ(f) and checks it equals 1 (passes the filter).
-Computes Poseidon(m, r) and checks it equals a public output h.
+---
+
+## 1. Component Breakdown
+
+### Poseidon Hash Function
+
+A hash function takes an arbitrary input and produces a fixed-size fingerprint. It is deterministic (the same input always yields the same output) and one-way (irreversible). While standard hash functions like SHA-256 exist, **Poseidon** is designed specifically to be computationally cheap inside a **zero-knowledge (ZK) circuit**.
+
+* **The Problem with SHA-256:** It relies on bitwise operations (XOR, bit rotations, AND). These are trivial for a standard CPU but brutally expensive to express as arithmetic constraints (additions and multiplications over a large prime field) inside ZK circuits. Every XOR must be decomposed into numerous field operations.
+* **The Poseidon Advantage:** It is built entirely from field-native operations from the ground up (additions, multiplications, and a nonlinear step). Consequently, representing it inside a circuit costs a fraction of what SHA-256 would.
+
+> **Key Takeaway:** Poseidon is optimized for being "cheap to prove" rather than for raw hardware speed. Inside your protocol, it computes $h = \text{Poseidon}(m, r)$ directly within the proof circuit to demonstrate: *"I know a message $m$ and blinding factor $r$ that hash to this specific $h$."*
+
+### Associated Data (AD)
+
+Associated Data is a native feature of Authenticated Encryption with Associated Data (AEAD) schemes—the encryption framework underlying Signal-style protocols (like the Double Ratchet).
+
+Standard encryption takes a key and plaintext to output a ciphertext and an authentication tag. AD acts as an optional third input: **extra data that remains unencrypted (travels in the clear) but is cryptographically bound to the ciphertext via the authentication tag.**
+
+```
+[Key] + [Plaintext] + [Associated Data (AD)] ---> [Ciphertext] + [Authentication Tag]
+
+```
+
+* **Integrity Enforcement:** If you encrypt message $m$ under key $K$ with $\text{AD} = h$, decryption will *only* succeed if the receiver provides that exact same $h$. Tweaking even a single bit of the AD causes the tag verification to fail, aborting decryption.
+* **Protocol Fit:** The Double Ratchet automatically computes an authentication tag over `(ciphertext, AD)`. By assigning $\text{AD} = (h, r)$, the message fingerprint safely accompanies the payload. Any tampering with the fingerprint breaks decryption automatically, without requiring modifications to the ratchet's internal logic.
+
+### Plonky2
+
+Plonky2 is the proving system—the underlying machinery that transforms the statement *"I know secret values satisfying these constraints"* into a compact, easily verifiable proof ($\pi$) without exposing the underlying secrets.
+
+Two properties make it ideal for this use case:
+
+1. **Transparent Setup:** Unlike systems like Groth16, Plonky2 does not require a one-time "trusted setup" ceremony per circuit. If you modify the circuit (e.g., updating the classification model), you do not need to redo any cryptographic setup.
+2. **Fast Proving & Native Rust:** It is one of the fastest available provers for circuits of this scale. Because your CLI is built in Rust, it integrates natively without needing awkward language bridges.
+
+> **Circuit Logic:** Inside Plonky2, you define the constraints:
+> *Given public values $\theta, b, \tau, h$ and private (secret) witnesses $m, r$, verify that:*
+> 
+> $$C_\theta(\phi(m)) = 1 \quad \text{AND} \quad \text{Poseidon}(m, r) = h$$
+> 
+> 
+
+---
+
+## 2. Integrated Data Flow
+
+The following sequence details how the components interact across the sender, server, and receiver during a single message transmission.
+
+### Phase 1: Local Sender Operations
+
+1. **Feature Extraction:** The sender takes plaintext $m$ and generates a random blinding factor $r$. They compute the feature vector $f = \phi(m)$ locally as a plain computation (outside the ZK circuit).
+2. **Proof Generation:** The sender feeds $(m, r, f)$ as private witnesses and $(\theta, b, \tau)$ as public inputs into the Plonky2 circuit. The circuit internally:
+* Computes $C_\theta(f)$ and verifies it equals $1$ (passing the filter).
+* Computes $\text{Poseidon}(m, r)$ and verifies it matches the public output $h$.
 
 
-Plonky2's prover outputs (h, π) — the fingerprint and the proof. Neither reveals m.
-Sender calls the normal Double Ratchet encryption function on m, but sets AD = (h, r). This produces (ciphertext, tag). The tag now cryptographically locks h and r to this specific ciphertext.
-Sender transmits (ciphertext, tag, h, r, π) to the server.
-Server: runs Plonky2's verifier on (θ, b, τ, h, π) — cheap, fast, doesn't need m. If valid, forwards (ciphertext, tag, h, r) to the receiver. Never decrypts, never sees m.
-Receiver: decrypts using AD = (h, r) as given — decryption only succeeds if h, r weren't tampered with (that's AD's job). This recovers m.
-Receiver independently recomputes Poseidon(m, r) (plain computation, no circuit needed here) and checks it equals h. If it matches, the message that was proven-clean is provably the message that arrived. If not, they've caught a sender who proved one thing and sent another.
+3. **Output:** The Plonky2 prover outputs the fingerprint and proof pair: $(h, \pi)$. Neither value leaks the contents of $m$.
+4. **Payload Encryption:** The sender invokes the standard Double Ratchet encryption function on $m$, setting $\text{AD} = (h, r)$ to output `(ciphertext, tag)`.
+5. **Transmission:** The sender transmits the final bundle to the server:
+
+$$\text{Payload} = (\text{ciphertext}, \text{tag}, h, r, \pi)$$
+
+
+
+### Phase 2: Server Verification
+
+1. **Validation:** The server runs the Plonky2 verifier on the public inputs $(\theta, b, \tau, h, \pi)$. This operation is fast, lightweight, and requires no access to the plaintext $m$.
+2. **Routing:** * **If valid:** The server forwards $(\text{ciphertext}, \text{tag}, h, r)$ to the receiver.
+* **If invalid:** The payload is dropped.
+* *Note: The server never decrypts the payload and never sees $m$.*
+
+
+
+### Phase 3: Receiver Decryption & Binding Check
+
+1. **AEAD Decryption:** The receiver attempts to decrypt the ciphertext using the provided $\text{AD} = (h, r)$. If $h$ or $r$ were altered during transit, decryption fails immediately. Successful decryption yields the plaintext $m$.
+2. **Equivalence Check:** The receiver independently recomputes $\text{Poseidon}(m, r)$ via plain local computation (no ZK circuit required) and verifies that the output matches the transmitted $h$.
+* **Match:** The message is verified as the exact payload cleared by the sender's local ZK proof.
+* **Mismatch:** The message is rejected, catching a malicious sender who proved validity for one message but transmitted another.
