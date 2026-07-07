@@ -1,6 +1,4 @@
-Here is the text refactored into a cleanly structured, highly scannable Markdown document.
 
----
 
 # Cryptographic Architecture Overview
 
