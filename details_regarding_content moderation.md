@@ -1,7 +1,4 @@
-Here is the text refactored into a cleanly structured, highly scannable Markdown document.
-
----
-
+20
 # Cryptographic Architecture Overview
 
 This document outlines the core cryptographic components and the integrated data flow used to achieve private, verifiable message filtering.
