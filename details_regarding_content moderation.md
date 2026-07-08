@@ -1,4 +1,9 @@
+<<<<<<< HEAD
 20
+=======
+
+
+>>>>>>> a380ae43784c9ff8b3b9d382d40ce0ec1833f013
 # Cryptographic Architecture Overview
 
 This document outlines the core cryptographic components and the integrated data flow used to achieve private, verifiable message filtering.
